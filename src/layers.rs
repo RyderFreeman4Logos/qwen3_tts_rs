@@ -464,6 +464,11 @@ impl Attention {
             let attn_weights = attn_weights.softmax(-1);
 
             // Apply attention to values
+            let value = if value.kind() != attn_weights.kind() {
+                value.to_dtype(attn_weights.kind())
+            } else {
+                value
+            };
             attn_weights.matmul(&value)
         };
 
