@@ -14,9 +14,52 @@ use crate::error::{Qwen3TTSError, Result};
 use crate::layers::{Linear, RMSNorm, RotaryEmbedding, TransformerLayer};
 use crate::tensor::{DType, Device, Tensor};
 use crate::vocoder::{load_vocoder_weights, Vocoder, VocoderConfig};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::OnceLock;
 use tokenizers::Tokenizer;
+
+#[derive(Clone, Copy, Debug)]
+struct DecodeRuntimeOptions {
+    context_window: Option<i64>,
+    fast_repetition_penalty: bool,
+}
+
+fn decode_runtime_options() -> DecodeRuntimeOptions {
+    static OPTIONS: OnceLock<DecodeRuntimeOptions> = OnceLock::new();
+    *OPTIONS.get_or_init(|| {
+        let context_window = std::env::var("RUST_TTS_CONTEXT_WINDOW")
+            .ok()
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .filter(|&n| n > 0);
+        let fast_repetition_penalty = std::env::var("RUST_TTS_FAST_REPETITION")
+            .ok()
+            .and_then(|s| match s.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "on" => Some(true),
+                "0" | "false" | "no" | "off" => Some(false),
+                _ => None,
+            })
+            .unwrap_or(true);
+
+        DecodeRuntimeOptions {
+            context_window,
+            fast_repetition_penalty,
+        }
+    })
+}
+
+fn cached_causal_mask(cache: &mut HashMap<i64, Tensor>, seq_len: i64, device: Device) -> Tensor {
+    if let Some(mask) = cache.get(&seq_len) {
+        return mask.shallow_clone();
+    }
+    let mask_zeros = Tensor::zeros(&[seq_len, seq_len], DType::Float32, device);
+    let upper = Tensor::ones(&[seq_len, seq_len], DType::Bool, device).triu(1);
+    let causal_mask = mask_zeros
+        .masked_fill(&upper, f64::NEG_INFINITY)
+        .view(&[1, 1, seq_len, seq_len]);
+    cache.insert(seq_len, causal_mask.shallow_clone());
+    causal_mask
+}
 
 /// Code predictor sub-transformer for generating codes 1-15 autoregressively.
 ///
@@ -170,6 +213,7 @@ impl CodePredictor {
         top_k: i64,
     ) -> Vec<i64> {
         let mut codes = Vec::new();
+        let mut causal_mask_cache: HashMap<i64, Tensor> = HashMap::new();
 
         // Start with [main_hidden, code_0_embedding] as input
         // Note: For 1.7B+ models, these are at main_hidden_size (2048), not code_predictor hidden_size (1024)
@@ -183,12 +227,7 @@ impl CodePredictor {
 
         for step in 0..self.lm_heads.len() {
             let seq_len = sequence.size()[1];
-
-            // Create causal mask
-            let mask = Tensor::zeros(&[seq_len, seq_len], DType::Float32, self.device);
-            let upper = Tensor::ones(&[seq_len, seq_len], DType::Bool, self.device).triu(1);
-            let causal_mask = mask.masked_fill(&upper, f64::NEG_INFINITY);
-            let causal_mask = causal_mask.view(&[1, 1, seq_len, seq_len]);
+            let causal_mask = cached_causal_mask(&mut causal_mask_cache, seq_len, self.device);
 
             // Apply projection if present (1.7B+ models: project from 2048 to 1024)
             let projected_sequence = if let Some(ref proj) = self.small_to_mtp_projection {
@@ -807,32 +846,82 @@ impl TalkerModel {
         top_k: i64,
         repetition_penalty: f64,
         past_codes: &[i64],
+        fast_repetition_penalty: bool,
     ) -> i64 {
         let last_hidden = normed_hidden.select(1, normed_hidden.size()[1] - 1);
         let mut logits = self.codec_head.forward(&last_hidden);
 
         // Apply repetition penalty to previously generated codes
         if repetition_penalty != 1.0 && !past_codes.is_empty() {
-            let logits_data = logits.to_vec_f32();
-            let vocab_size = logits.size()[logits.dim() - 1] as usize;
-            let mut modified = logits_data.clone();
-
+            let mut unique_codes = Vec::new();
+            let mut seen = HashSet::new();
             for &code in past_codes {
-                let idx = code as usize;
-                if idx < vocab_size {
-                    let score = modified[idx];
-                    // Penalize: divide positive logits, multiply negative logits
-                    modified[idx] = if score > 0.0 {
-                        score / repetition_penalty as f32
-                    } else {
-                        score * repetition_penalty as f32
-                    };
+                if seen.insert(code) {
+                    unique_codes.push(code);
                 }
             }
 
-            logits = Tensor::from_slice_f32(&modified)
-                .reshape(&logits.size())
-                .to_device(self.device);
+            let vocab_size = logits.size()[logits.dim() - 1] as usize;
+            #[cfg(feature = "tch-backend")]
+            if fast_repetition_penalty {
+                let valid_codes: Vec<i64> = unique_codes
+                    .iter()
+                    .copied()
+                    .filter(|&code| code >= 0 && (code as usize) < vocab_size)
+                    .collect();
+                if !valid_codes.is_empty() {
+                    let device = logits.as_tch().device();
+                    let index = tch::Tensor::from_slice(&valid_codes).to_device(device);
+                    let selected = logits.as_tch().index_select(-1, &index);
+                    let positive = selected.gt(0.0);
+                    let positive_factor =
+                        positive.to_kind(selected.kind()) * (1.0 / repetition_penalty);
+                    let negative_factor =
+                        positive.logical_not().to_kind(selected.kind()) * repetition_penalty;
+                    let factors = positive_factor + negative_factor;
+                    let adjusted = selected * factors;
+
+                    let mut updated = logits.as_tch().shallow_clone();
+                    let _ = updated.index_copy_(-1, &index, &adjusted);
+                    logits = Tensor::from_tch(updated);
+                }
+            } else {
+                let mut modified = logits.to_vec_f32();
+                for &code in &unique_codes {
+                    let idx = code as usize;
+                    if idx < vocab_size {
+                        let score = modified[idx];
+                        // Penalize: divide positive logits, multiply negative logits
+                        modified[idx] = if score > 0.0 {
+                            score / repetition_penalty as f32
+                        } else {
+                            score * repetition_penalty as f32
+                        };
+                    }
+                }
+                logits = Tensor::from_slice_f32(&modified)
+                    .reshape(&logits.size())
+                    .to_device(self.device);
+            }
+
+            #[cfg(not(feature = "tch-backend"))]
+            {
+                let mut modified = logits.to_vec_f32();
+                for &code in &unique_codes {
+                    let idx = code as usize;
+                    if idx < vocab_size {
+                        let score = modified[idx];
+                        modified[idx] = if score > 0.0 {
+                            score / repetition_penalty as f32
+                        } else {
+                            score * repetition_penalty as f32
+                        };
+                    }
+                }
+                logits = Tensor::from_slice_f32(&modified)
+                    .reshape(&logits.size())
+                    .to_device(self.device);
+            }
         }
 
         if temperature <= 0.0 {
@@ -866,22 +955,30 @@ impl TalkerModel {
         eos_code: i64,
         tts_pad_embed: &Tensor,
     ) -> Vec<Vec<i64>> {
+        let runtime_opts = decode_runtime_options();
         let repetition_penalty = 1.05; // From generation_config.json
         let mut all_codes = Vec::new();
         let mut past_code_0s: Vec<i64> = Vec::new();
         let mut full_sequence = input_embeddings.shallow_clone();
+        let mut causal_mask_cache: HashMap<i64, Tensor> = HashMap::new();
 
         for step in 0..max_codes {
-            let seq_len = full_sequence.size()[1];
-
-            // Create causal mask
-            let mask_zeros = Tensor::zeros(&[seq_len, seq_len], DType::Float32, self.device);
-            let upper = Tensor::ones(&[seq_len, seq_len], DType::Bool, self.device).triu(1);
-            let causal_mask = mask_zeros.masked_fill(&upper, f64::NEG_INFINITY);
-            let causal_mask = causal_mask.view(&[1, 1, seq_len, seq_len]);
+            let sequence_for_step = if let Some(window) = runtime_opts.context_window {
+                let available = full_sequence.size()[1];
+                let keep = available.min(window);
+                if keep < available {
+                    full_sequence.narrow(1, available - keep, keep)
+                } else {
+                    full_sequence.shallow_clone()
+                }
+            } else {
+                full_sequence.shallow_clone()
+            };
+            let seq_len = sequence_for_step.size()[1];
+            let causal_mask = cached_causal_mask(&mut causal_mask_cache, seq_len, self.device);
 
             // Run through transformer
-            let normed_hidden = self.forward_embeds(&full_sequence, Some(&causal_mask));
+            let normed_hidden = self.forward_embeds(&sequence_for_step, Some(&causal_mask));
 
             // Predict code 0 from main model (with repetition penalty)
             let code_0 = self.predict_code_0(
@@ -890,6 +987,7 @@ impl TalkerModel {
                 top_k,
                 repetition_penalty,
                 &past_code_0s,
+                runtime_opts.fast_repetition_penalty,
             );
 
             // Track past code 0s for repetition penalty
@@ -943,6 +1041,12 @@ impl TalkerModel {
 
             // Append to sequence
             full_sequence = Tensor::cat(&[full_sequence, next_input], 1);
+            if let Some(window) = runtime_opts.context_window {
+                let current = full_sequence.size()[1];
+                if current > window {
+                    full_sequence = full_sequence.narrow(1, current - window, window);
+                }
+            }
 
             if step % 10 == 0 {
                 println!("  Generated {} code frames", step + 1);
