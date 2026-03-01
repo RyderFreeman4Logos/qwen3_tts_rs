@@ -959,20 +959,47 @@ impl TalkerModel {
         let repetition_penalty = 1.05; // From generation_config.json
         let mut all_codes = Vec::new();
         let mut past_code_0s: Vec<i64> = Vec::new();
-        let mut full_sequence = input_embeddings.shallow_clone();
+        // Keep the original prompt/ICL prefix immutable.
+        // When a context window is configured, we only slide over generated history
+        // so the prefix is never dropped (avoids quality collapse after ~window-prefix steps).
+        let prefix_sequence = input_embeddings.shallow_clone();
+        let prefix_len = prefix_sequence.size()[1];
+        let mut generated_history =
+            Tensor::zeros(&[1, 0, self.hidden_size], DType::Float32, self.device);
+        let mut warned_small_window = false;
         let mut causal_mask_cache: HashMap<i64, Tensor> = HashMap::new();
 
         for step in 0..max_codes {
             let sequence_for_step = if let Some(window) = runtime_opts.context_window {
-                let available = full_sequence.size()[1];
-                let keep = available.min(window);
-                if keep < available {
-                    full_sequence.narrow(1, available - keep, keep)
+                let min_window = prefix_len + 1;
+                let effective_window = if window < min_window {
+                    if !warned_small_window {
+                        println!(
+                            "  context_window={} is smaller than required prefix+1={} (prefix_len={}); using {}",
+                            window, min_window, prefix_len, min_window
+                        );
+                        warned_small_window = true;
+                    }
+                    min_window
                 } else {
-                    full_sequence.shallow_clone()
-                }
+                    window
+                };
+                let keep_generated = effective_window - prefix_len;
+                let generated_len = generated_history.size()[1];
+                let generated_tail = if generated_len > keep_generated {
+                    generated_history.narrow(1, generated_len - keep_generated, keep_generated)
+                } else {
+                    generated_history.shallow_clone()
+                };
+                Tensor::cat(&[prefix_sequence.shallow_clone(), generated_tail], 1)
             } else {
-                full_sequence.shallow_clone()
+                Tensor::cat(
+                    &[
+                        prefix_sequence.shallow_clone(),
+                        generated_history.shallow_clone(),
+                    ],
+                    1,
+                )
             };
             let seq_len = sequence_for_step.size()[1];
             let causal_mask = cached_causal_mask(&mut causal_mask_cache, seq_len, self.device);
@@ -1039,14 +1066,8 @@ impl TalkerModel {
             // Add trailing text (tts_pad for non-streaming mode)
             let next_input = &code_embeds_sum + tts_pad_embed;
 
-            // Append to sequence
-            full_sequence = Tensor::cat(&[full_sequence, next_input], 1);
-            if let Some(window) = runtime_opts.context_window {
-                let current = full_sequence.size()[1];
-                if current > window {
-                    full_sequence = full_sequence.narrow(1, current - window, window);
-                }
-            }
+            // Append to generated history (prefix stays immutable).
+            generated_history = Tensor::cat(&[generated_history, next_input], 1);
 
             if step % 10 == 0 {
                 println!("  Generated {} code frames", step + 1);
