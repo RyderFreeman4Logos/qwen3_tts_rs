@@ -1083,11 +1083,39 @@ impl TTSInference {
         }
 
         let vocoder = self.vocoder.as_ref()?;
+        let chunk_frames = std::env::var("RUST_TTS_VOCODER_CHUNK")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0);
+
+        if let Some(frames_per_chunk) = chunk_frames {
+            println!(
+                "Decoding audio with vocoder in chunks (frames_per_chunk={})...",
+                frames_per_chunk
+            );
+            let mut merged = Vec::new();
+            let mut start = 0usize;
+            while start < codes.len() {
+                let end = (start + frames_per_chunk).min(codes.len());
+                let chunk = self.decode_codes_to_audio_slice(vocoder, &codes[start..end])?;
+                merged.extend(chunk);
+                start = end;
+            }
+            println!("Decoded {} audio samples (chunked)", merged.len());
+            return Some(merged);
+        }
 
         println!("Decoding audio with vocoder...");
+        self.decode_codes_to_audio_slice(vocoder, codes)
+    }
 
+    fn decode_codes_to_audio_slice(
+        &self,
+        vocoder: &Vocoder,
+        codes: &[Vec<i64>],
+    ) -> Option<Vec<f32>> {
         let num_frames = codes.len();
-        let num_quantizers = codes[0].len();
+        let num_quantizers = codes.first()?.len();
         let codebook_size = 2048i64;
 
         // Flatten codes and clamp to valid range, counting out-of-range values
@@ -1119,8 +1147,17 @@ impl TTSInference {
 
         println!("Codes tensor shape: {:?}", codes_tensor.size());
 
-        // Decode with vocoder
-        let audio_tensor = vocoder.decode(&codes_tensor);
+        // Decode with vocoder. Catch panic from backend OOM paths so callers can
+        // degrade gracefully instead of aborting the whole request pipeline.
+        let audio_tensor = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            vocoder.decode(&codes_tensor)
+        })) {
+            Ok(tensor) => tensor,
+            Err(_) => {
+                println!("Warning: vocoder decode panicked (likely OOM)");
+                return None;
+            }
+        };
         println!("Vocoder output shape: {:?}", audio_tensor.size());
 
         // Convert tensor to Vec<f32>
