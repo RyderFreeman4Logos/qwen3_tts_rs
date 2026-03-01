@@ -114,7 +114,15 @@ impl Linear {
 
     /// Apply linear transformation: x @ W^T + bias.
     pub fn forward(&self, x: &Tensor) -> Tensor {
-        let out = x.matmul(&self.weight.tr());
+        // tch backend panics on matmul dtype mismatch (e.g. Float32 input with BF16 weights).
+        // Align input dtype to weight dtype to preserve low-VRAM BF16 weights safely.
+        let x_aligned = if x.kind() != self.weight.kind() {
+            x.to_dtype(self.weight.kind())
+        } else {
+            x.shallow_clone()
+        };
+
+        let out = x_aligned.matmul(&self.weight.tr());
         if let Some(ref bias) = self.bias {
             &out + bias
         } else {
