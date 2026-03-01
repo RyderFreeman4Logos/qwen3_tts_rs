@@ -6,12 +6,12 @@
 //! This module implements the core neural network layers used by the
 //! TTS model, including attention, MLP, normalization, and vocoder layers.
 
-use std::collections::HashMap;
-use crate::tensor::{Tensor, Device, DType};
-#[cfg(feature = "tch-backend")]
-use tch::nn;
 #[cfg(feature = "mlx")]
 use crate::backend::mlx;
+use crate::tensor::{DType, Device, Tensor};
+use std::collections::HashMap;
+#[cfg(feature = "tch-backend")]
+use tch::nn;
 
 /// RMS Normalization layer.
 pub struct RMSNorm {
@@ -96,9 +96,9 @@ impl Linear {
 
     /// Load Linear from pre-loaded weight tensor (no bias).
     pub fn from_weights(weight: Tensor) -> Self {
-        // Convert to float32 for stable computation
         Self {
-            weight: weight.to_dtype(DType::Float32),
+            // Keep checkpoint dtype (BF16 for Qwen3 models) to reduce VRAM footprint.
+            weight,
             bias: None,
         }
     }
@@ -106,8 +106,9 @@ impl Linear {
     /// Load Linear from pre-loaded weight and bias tensors.
     pub fn from_weights_with_bias(weight: Tensor, bias: Tensor) -> Self {
         Self {
-            weight: weight.to_dtype(DType::Float32),
-            bias: Some(bias.to_dtype(DType::Float32)),
+            // Keep checkpoint dtype (BF16 for Qwen3 models) to reduce VRAM footprint.
+            weight,
+            bias: Some(bias),
         }
     }
 
@@ -280,28 +281,24 @@ impl Attention {
     ) -> Option<Self> {
         let q_proj = weights
             .get(&format!("{}.q_proj.weight", prefix))?
-            .to_device(device)
-            .to_dtype(DType::Float32);
+            .to_device(device);
         let k_proj = weights
             .get(&format!("{}.k_proj.weight", prefix))?
-            .to_device(device)
-            .to_dtype(DType::Float32);
+            .to_device(device);
         let v_proj = weights
             .get(&format!("{}.v_proj.weight", prefix))?
-            .to_device(device)
-            .to_dtype(DType::Float32);
+            .to_device(device);
         let o_proj = weights
             .get(&format!("{}.o_proj.weight", prefix))?
-            .to_device(device)
-            .to_dtype(DType::Float32);
+            .to_device(device);
 
         // Load Q/K norm if present
         let q_norm = weights
             .get(&format!("{}.q_norm.weight", prefix))
-            .map(|t| t.to_device(device).to_dtype(DType::Float32));
+            .map(|t| t.to_device(device));
         let k_norm = weights
             .get(&format!("{}.k_norm.weight", prefix))
-            .map(|t| t.to_device(device).to_dtype(DType::Float32));
+            .map(|t| t.to_device(device));
 
         Some(Self {
             q_proj: Linear::from_weights(q_proj),
@@ -650,16 +647,13 @@ impl MLP {
     ) -> Option<Self> {
         let gate_proj = weights
             .get(&format!("{}.gate_proj.weight", prefix))?
-            .to_device(device)
-            .to_dtype(DType::Float32);
+            .to_device(device);
         let up_proj = weights
             .get(&format!("{}.up_proj.weight", prefix))?
-            .to_device(device)
-            .to_dtype(DType::Float32);
+            .to_device(device);
         let down_proj = weights
             .get(&format!("{}.down_proj.weight", prefix))?
-            .to_device(device)
-            .to_dtype(DType::Float32);
+            .to_device(device);
 
         Some(Self {
             gate_proj: Linear::from_weights(gate_proj),

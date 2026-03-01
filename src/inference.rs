@@ -12,10 +12,10 @@
 use crate::config::{Qwen3TTSConfig, TalkerCodePredictorConfig, TalkerConfig};
 use crate::error::{Qwen3TTSError, Result};
 use crate::layers::{Linear, RMSNorm, RotaryEmbedding, TransformerLayer};
+use crate::tensor::{DType, Device, Tensor};
 use crate::vocoder::{load_vocoder_weights, Vocoder, VocoderConfig};
 use std::collections::HashMap;
 use std::path::Path;
-use crate::tensor::{Tensor, Device, DType};
 use tokenizers::Tokenizer;
 
 /// Code predictor sub-transformer for generating codes 1-15 autoregressively.
@@ -69,7 +69,7 @@ impl CodePredictor {
         for i in 0..(num_code_groups - 1) {
             let key = format!("talker.code_predictor.model.codec_embedding.{}.weight", i);
             if let Some(tensor) = weights.get(&key) {
-                code_embeddings.push(tensor.to_device(device).to_dtype(DType::Float32));
+                code_embeddings.push(tensor.to_device(device));
             }
         }
         println!(
@@ -103,8 +103,7 @@ impl CodePredictor {
         let norm_weight = weights
             .get("talker.code_predictor.model.norm.weight")
             .ok_or_else(|| Qwen3TTSError::ModelLoad("Missing code_predictor norm.weight".into()))?
-            .to_device(device)
-            .to_dtype(DType::Float32);
+            .to_device(device);
         let norm = RMSNorm::from_weights(norm_weight, rms_norm_eps);
 
         // Load LM heads (15 for codes 1-15)
@@ -112,9 +111,7 @@ impl CodePredictor {
         for i in 0..(num_code_groups - 1) {
             let key = format!("talker.code_predictor.lm_head.{}.weight", i);
             if let Some(tensor) = weights.get(&key) {
-                lm_heads.push(Linear::from_weights(
-                    tensor.to_device(device).to_dtype(DType::Float32),
-                ));
+                lm_heads.push(Linear::from_weights(tensor.to_device(device)));
             }
         }
         println!("  Loaded {} code_predictor LM heads", lm_heads.len());
@@ -126,11 +123,11 @@ impl CodePredictor {
             let proj_bias = weights.get("talker.code_predictor.small_to_mtp_projection.bias");
             let proj = if let Some(bias) = proj_bias {
                 Linear::from_weights_with_bias(
-                    proj_weight.to_device(device).to_dtype(DType::Float32),
-                    bias.to_device(device).to_dtype(DType::Float32),
+                    proj_weight.to_device(device),
+                    bias.to_device(device),
                 )
             } else {
-                Linear::from_weights(proj_weight.to_device(device).to_dtype(DType::Float32))
+                Linear::from_weights(proj_weight.to_device(device))
             };
             println!("  Loaded small_to_mtp_projection");
             Some(proj)
@@ -312,8 +309,7 @@ impl TalkerModel {
         let text_embedding = weights
             .get("talker.model.text_embedding.weight")
             .ok_or_else(|| Qwen3TTSError::ModelLoad("Missing text_embedding.weight".into()))?
-            .to_device(device)
-            .to_dtype(DType::Float32);
+            .to_device(device);
         println!("  Loaded text_embedding: {:?}", text_embedding.size());
 
         // Load text projection layers (2048 -> 1024)
@@ -322,29 +318,25 @@ impl TalkerModel {
             .ok_or_else(|| {
                 Qwen3TTSError::ModelLoad("Missing text_projection.linear_fc1.weight".into())
             })?
-            .to_device(device)
-            .to_dtype(DType::Float32);
+            .to_device(device);
         let text_proj_fc1_bias = weights
             .get("talker.text_projection.linear_fc1.bias")
             .ok_or_else(|| {
                 Qwen3TTSError::ModelLoad("Missing text_projection.linear_fc1.bias".into())
             })?
-            .to_device(device)
-            .to_dtype(DType::Float32);
+            .to_device(device);
         let text_proj_fc2_weight = weights
             .get("talker.text_projection.linear_fc2.weight")
             .ok_or_else(|| {
                 Qwen3TTSError::ModelLoad("Missing text_projection.linear_fc2.weight".into())
             })?
-            .to_device(device)
-            .to_dtype(DType::Float32);
+            .to_device(device);
         let text_proj_fc2_bias = weights
             .get("talker.text_projection.linear_fc2.bias")
             .ok_or_else(|| {
                 Qwen3TTSError::ModelLoad("Missing text_projection.linear_fc2.bias".into())
             })?
-            .to_device(device)
-            .to_dtype(DType::Float32);
+            .to_device(device);
         println!("  Loaded text_projection layers");
 
         // Load main codec embedding [3072, 1024]
@@ -353,8 +345,7 @@ impl TalkerModel {
             .ok_or_else(|| {
                 Qwen3TTSError::ModelLoad("Missing talker.model.codec_embedding.weight".into())
             })?
-            .to_device(device)
-            .to_dtype(DType::Float32);
+            .to_device(device);
         println!("  Loaded codec_embedding: {:?}", codec_embedding.size());
 
         // Load transformer layers
@@ -383,8 +374,7 @@ impl TalkerModel {
         let norm_weight = weights
             .get("talker.model.norm.weight")
             .ok_or_else(|| Qwen3TTSError::ModelLoad("Missing norm.weight".into()))?
-            .to_device(device)
-            .to_dtype(DType::Float32);
+            .to_device(device);
         let norm = RMSNorm::from_weights(norm_weight, rms_norm_eps);
         println!("  Loaded final norm");
 
@@ -392,8 +382,7 @@ impl TalkerModel {
         let codec_head_weight = weights
             .get("talker.codec_head.weight")
             .ok_or_else(|| Qwen3TTSError::ModelLoad("Missing talker.codec_head.weight".into()))?
-            .to_device(device)
-            .to_dtype(DType::Float32);
+            .to_device(device);
         let codec_head = Linear::from_weights(codec_head_weight);
         println!("  Loaded codec_head");
 
@@ -574,9 +563,7 @@ impl TalkerModel {
         ]); // [1, 4, 1024]
 
         // Speaker embedding: use provided x-vector directly (reshape to [1, 1, 1024])
-        let spk_embed = speaker_embedding
-            .to_dtype(DType::Float32)
-            .to_device(self.device);
+        let spk_embed = speaker_embedding.to_device(self.device);
         let spk_embed = if spk_embed.dim() == 1 {
             spk_embed.unsqueeze(0).unsqueeze(0) // [1024] → [1, 1, 1024]
         } else if spk_embed.dim() == 2 {
@@ -689,9 +676,7 @@ impl TalkerModel {
         ]); // [1, 4, 1024]
 
         // Speaker embedding
-        let spk_embed = speaker_embedding
-            .to_dtype(DType::Float32)
-            .to_device(self.device);
+        let spk_embed = speaker_embedding.to_device(self.device);
         let spk_embed = if spk_embed.dim() == 1 {
             spk_embed.unsqueeze(0).unsqueeze(0)
         } else if spk_embed.dim() == 2 {
