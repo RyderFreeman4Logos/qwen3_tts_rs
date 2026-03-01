@@ -32,11 +32,13 @@ impl Conv1d {
         let weight = weights
             .get(&format!("{}.weight", prefix))
             .ok_or_else(|| Qwen3TTSError::ModelLoad(format!("Missing {}.weight", prefix)))?
-            .to_device(device);
+            .to_device(device)
+            .to_dtype(DType::Float32);
         let bias = weights
             .get(&format!("{}.bias", prefix))
             .ok_or_else(|| Qwen3TTSError::ModelLoad(format!("Missing {}.bias", prefix)))?
-            .to_device(device);
+            .to_device(device)
+            .to_dtype(DType::Float32);
         Ok(Self { weight, bias })
     }
 
